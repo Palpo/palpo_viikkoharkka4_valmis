@@ -10,6 +10,8 @@ from google.appengine.ext import ndb
 from mr import PredatorCountPipeline
 from mapreduce import mapreduce_pipeline
 
+import cloudstorage as gcs
+
 
 JINJA_ENVIRONMENT = jinja2.Environment(
     loader=jinja2.FileSystemLoader(os.path.dirname(__file__)),
@@ -65,9 +67,17 @@ class MapRecuceHandler(webapp2.RequestHandler):
         pipeline_id = self.request.get("pipeline")
         pipeline = mapreduce_pipeline.MapreducePipeline.from_id(pipeline_id)
         if pipeline.has_finalized:
-            self.response.write("MapReduce-työ valmis.\n")
+            self.response.write("MapReduce-työ valmis:\n")
             mrr = MapReduceResult.get_by_id(pipeline_id)
-            self.response.write("Tulokset tallennettu tiedostoon %s\n" % (mrr.result_file,))
+            if not mrr.result_file.startswith('/gs/'):
+                raise Exception("??? %s ???" % (mrr.result_file,))
+            gcs_filename = mrr.result_file[3:]
+            f = gcs.open(gcs_filename)
+            for li in f:
+                aid, n = li.split(',')
+                animal = Animal.get_by_id(int(aid), parent=PARENT)
+                self.response.write(u"Eläimellä %s on %i saalistajaa.\n" % (animal.name, int(n)))
+            f.close()
         else:
             self.response.write("MapReduce-työ käynnissä... Päivitä sivu...")
 
