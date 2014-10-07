@@ -9,4 +9,3 @@ class Animal(ndb.Model):
     def as_dict(self):
         prey = [p.get().name for p in self.prey]
         return {'id': self.key.id(), 'name': self.name, 'prey': prey }
-    

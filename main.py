@@ -7,6 +7,8 @@ import jinja2
 
 from models import Animal
 from google.appengine.ext import ndb
+from mr import PredatorCountPipeline
+from mapreduce import mapreduce_pipeline
 
 
 JINJA_ENVIRONMENT = jinja2.Environment(
@@ -49,14 +51,19 @@ class NewPreyHandler(webapp2.RequestHandler):
 
 class MapRecuceHandler(webapp2.RequestHandler):
     def post(self):
-        
-        # TODO
-        
-        self.redirect('/mr')
+        pipeline = PredatorCountPipeline()
+        pipeline.start()
+        plid = pipeline.pipeline_id
+        self.redirect('/mr?pipeline=%s'%plid)
 
     def get(self):
         self.response.headers['content-type'] = 'text/plain; charset=utf-8'
-        self.response.write("...")
+        pipeline_id = self.request.get("pipeline")
+        pipeline = mapreduce_pipeline.MapreducePipeline.from_id(pipeline_id)
+        if pipeline.has_finalized:
+            self.response.write("MapReduce-työ valmis.\n")
+        else:
+            self.response.write("MapReduce-työ käynnissä... Päivitä sivu...")
 
 
 app = webapp2.WSGIApplication([
