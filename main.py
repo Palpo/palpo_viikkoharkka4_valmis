@@ -5,7 +5,7 @@ import webapp2
 import jinja2
 
 
-from models import Animal
+from models import Animal, MapReduceResult
 from google.appengine.ext import ndb
 from mr import PredatorCountPipeline
 from mapreduce import mapreduce_pipeline
@@ -48,12 +48,16 @@ class NewPreyHandler(webapp2.RequestHandler):
         
         self.redirect('/')
         
-
+        
 class MapRecuceHandler(webapp2.RequestHandler):
     def post(self):
         pipeline = PredatorCountPipeline()
         pipeline.start()
+        
         plid = pipeline.pipeline_id
+        mrr = MapReduceResult(key=ndb.Key(MapReduceResult, plid), pipeline_id=plid)
+        mrr.put()
+        
         self.redirect('/mr?pipeline=%s'%plid)
 
     def get(self):
@@ -62,6 +66,8 @@ class MapRecuceHandler(webapp2.RequestHandler):
         pipeline = mapreduce_pipeline.MapreducePipeline.from_id(pipeline_id)
         if pipeline.has_finalized:
             self.response.write("MapReduce-työ valmis.\n")
+            mrr = MapReduceResult.get_by_id(pipeline_id)
+            self.response.write("Tulokset tallennettu tiedostoon %s\n" % (mrr.result_file,))
         else:
             self.response.write("MapReduce-työ käynnissä... Päivitä sivu...")
 

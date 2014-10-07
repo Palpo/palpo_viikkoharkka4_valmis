@@ -5,7 +5,7 @@ import os
 from mapreduce import base_handler, mapreduce_pipeline
 
 from google.appengine.api import app_identity
-import logging
+from models import MapReduceResult
 
 
 def predator_count_map(animal):
@@ -20,8 +20,10 @@ def predator_count_reduce(animal_id, predator_ids):
 
 
 class StoreOutput(base_handler.PipelineBase):
-    def run(self, output):
-        logging.info("Tulokset tallennetaan tiedostoon %s" % (output[0],))
+    def run(self, pipeline_id, output):
+        mrr = MapReduceResult.get_by_id(pipeline_id)
+        mrr.result_file = output[0]
+        mrr.put()
 
 
 class PredatorCountPipeline(base_handler.PipelineBase):
@@ -31,7 +33,7 @@ class PredatorCountPipeline(base_handler.PipelineBase):
                                      app_identity.get_default_gcs_bucket_name())
         
         output = yield mapreduce_pipeline.MapreducePipeline(
-            "predator_count",
+            "word_count",
             "mr.predator_count_map",
             "mr.predator_count_reduce",
             "mapreduce.input_readers.DatastoreInputReader",
@@ -49,4 +51,4 @@ class PredatorCountPipeline(base_handler.PipelineBase):
                 },
             })
         
-        yield StoreOutput(output)
+        yield StoreOutput(self.pipeline_id, output)
