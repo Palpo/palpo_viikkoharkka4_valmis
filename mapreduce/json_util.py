@@ -1,19 +1,36 @@
 #!/usr/bin/env python
+# Copyright 2015 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Json related utilities."""
 import copy
 import datetime
 import logging
-from mapreduce.third_party import simplejson
+
+try:
+  import json
+except ImportError:
+  import simplejson as json
 
 from google.appengine.api import datastore_errors
 from google.appengine.api import datastore_types
 from google.appengine.ext import db
-
+from google.appengine.ext import ndb
 
 # pylint: disable=invalid-name
 
 
-class JsonEncoder(simplejson.JSONEncoder):
+class JsonEncoder(json.JSONEncoder):
   """MR customized json encoder."""
 
   TYPE_ID = "__mr_json_type"
@@ -28,7 +45,7 @@ class JsonEncoder(simplejson.JSONEncoder):
     return super(JsonEncoder, self).default(o)
 
 
-class JsonDecoder(simplejson.JSONDecoder):
+class JsonDecoder(json.JSONDecoder):
   """MR customized json decoder."""
 
   def __init__(self, **kwargs):
@@ -91,6 +108,20 @@ _register_json_primitive(datetime.datetime,
                          _json_encode_datetime,
                          _json_decode_datetime)
 
+# ndb.Key
+def _JsonEncodeKey(o):
+    """Json encode an ndb.Key object."""
+    return {'key_string': o.urlsafe()}
+
+def _JsonDecodeKey(d):
+    """Json decode a ndb.Key object."""
+    k_c = d['key_string']
+    if isinstance(k_c, (list, tuple)):
+        return ndb.Key(flat=k_c)
+    return ndb.Key(urlsafe=d['key_string'])
+
+_register_json_primitive(ndb.Key, _JsonEncodeKey, _JsonDecodeKey)
+
 
 class JsonMixin(object):
   """Simple, stateless json utilities mixin.
@@ -107,11 +138,11 @@ class JsonMixin(object):
     Returns:
       json representation as string.
     """
-    json = self.to_json()
+    _json = self.to_json()
     try:
-      return simplejson.dumps(json, sort_keys=True, cls=JsonEncoder)
+      return json.dumps(_json, sort_keys=True, cls=JsonEncoder)
     except:
-      logging.exception("Could not serialize JSON: %r", json)
+      logging.exception("Could not serialize JSON: %r", _json)
       raise
 
   @classmethod
@@ -124,7 +155,7 @@ class JsonMixin(object):
     Returns:
       New instance of the class with data loaded from json string.
     """
-    return cls.from_json(simplejson.loads(json_str, cls=JsonDecoder))
+    return cls.from_json(json.loads(json_str, cls=JsonDecoder))
 
 
 class JsonProperty(db.UnindexedProperty):
@@ -166,7 +197,7 @@ class JsonProperty(db.UnindexedProperty):
       json_value = value.to_json()
     if not json_value:
       return None
-    return datastore_types.Text(simplejson.dumps(
+    return datastore_types.Text(json.dumps(
         json_value, sort_keys=True, cls=JsonEncoder))
 
   def make_value_from_datastore(self, value):
@@ -181,10 +212,10 @@ class JsonProperty(db.UnindexedProperty):
 
     if value is None:
       return None
-    json = simplejson.loads(value, cls=JsonDecoder)
+    _json = json.loads(value, cls=JsonDecoder)
     if self.data_type == dict:
-      return json
-    return self.data_type.from_json(json)
+      return _json
+    return self.data_type.from_json(_json)
 
   def validate(self, value):
     """Validate value.
@@ -200,7 +231,7 @@ class JsonProperty(db.UnindexedProperty):
     """
     if value is not None and not isinstance(value, self.data_type):
       raise datastore_errors.BadValueError(
-          "Property %s must be convertible to a %s instance (%s)" % 
+          "Property %s must be convertible to a %s instance (%s)" %
           (self.name, self.data_type, value))
     return super(JsonProperty, self).validate(value)
 

@@ -29,27 +29,32 @@ import random
 import sys
 import time
 import traceback
-from mapreduce.third_party import simplejson
+import zlib
+
+try:
+  import json
+except ImportError:
+  import simplejson as json
 
 from google.appengine.ext import ndb
 
 from google.appengine import runtime
 from google.appengine.api import datastore_errors
 from google.appengine.api import logservice
-from google.appengine.api import modules
 from google.appengine.api import taskqueue
 from google.appengine.ext import db
 from mapreduce import base_handler
 from mapreduce import context
 from mapreduce import errors
 from mapreduce import input_readers
+from mapreduce import map_job_context
 from mapreduce import model
 from mapreduce import operation
 from mapreduce import output_writers
 from mapreduce import parameters
+from mapreduce import shard_life_cycle
 from mapreduce import util
 from mapreduce.api import map_job
-from mapreduce.api.map_job import shard_life_cycle
 from google.appengine.runtime import apiproxy_errors
 
 # pylint: disable=g-import-not-at-top
@@ -129,6 +134,8 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
     """Constructor."""
     super(MapperWorkerCallbackHandler, self).__init__(*args)
     self._time = time.time
+    self.slice_context = None
+    self.shard_context = None
 
   def _drop_gracefully(self):
     """Drop worker task gracefully.
@@ -293,11 +300,14 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
     assert shard_state.slice_start_time is not None
     assert shard_state.slice_request_id is not None
     request_ids = [shard_state.slice_request_id]
-    logs = list(logservice.fetch(
-        request_ids=request_ids,
-        # TODO(user): Remove after b/8173230 is fixed.
-        module_versions=[(os.environ["CURRENT_MODULE_ID"],
-                          modules.get_current_version_name())]))
+    logs = None
+    try:
+      logs = list(logservice.fetch(request_ids=request_ids))
+    except (apiproxy_errors.FeatureNotEnabledError,
+        apiproxy_errors.CapabilityDisabledError) as e:
+      # Managed VMs do not have access to the logservice API
+      # See https://groups.google.com/forum/#!topic/app-engine-managed-vms/r8i65uiFW0w
+      logging.warning("Ignoring exception: %s", e)
 
     if not logs or not logs[0].finished:
       return False
@@ -393,6 +403,19 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
       if last_slice:
         obj.end_shard(shard_context)
 
+  def _lc_start_slice(self, tstate, slice_id):
+    self._maintain_LC(tstate.output_writer, slice_id)
+    self._maintain_LC(tstate.input_reader, slice_id)
+    self._maintain_LC(tstate.handler, slice_id)
+
+  def _lc_end_slice(self, tstate, slice_id, last_slice=False):
+    self._maintain_LC(tstate.handler, slice_id, last_slice=last_slice,
+                      begin_slice=False)
+    self._maintain_LC(tstate.input_reader, slice_id, last_slice=last_slice,
+                      begin_slice=False)
+    self._maintain_LC(tstate.output_writer, slice_id, last_slice=last_slice,
+                      begin_slice=False)
+
   def handle(self):
     """Handle request.
 
@@ -449,16 +472,27 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
     job_config = map_job.JobConfig._to_map_job_config(
         spec,
         os.environ.get("HTTP_X_APPENGINE_QUEUENAME"))
-    job_context = map_job.JobContext(job_config)
-    self.shard_context = map_job.ShardContext(job_context, shard_state)
-    self.slice_context = map_job.SliceContext(self.shard_context,
-                                              shard_state,
-                                              tstate)
+    job_context = map_job_context.JobContext(job_config)
+    self.shard_context = map_job_context.ShardContext(job_context, shard_state)
+    self.slice_context = map_job_context.SliceContext(self.shard_context,
+                                                      shard_state,
+                                                      tstate)
     try:
       slice_id = tstate.slice_id
-      self._maintain_LC(tstate.handler, slice_id)
-      self._maintain_LC(tstate.input_reader, slice_id)
-      self._maintain_LC(tstate.output_writer, slice_id)
+      self._lc_start_slice(tstate, slice_id)
+
+      if shard_state.is_input_finished():
+        self._lc_end_slice(tstate, slice_id, last_slice=True)
+        # Finalize the stream and set status if there's no more input.
+        if (tstate.output_writer and
+            isinstance(tstate.output_writer, output_writers.OutputWriter)):
+          # It's possible that finalization is successful but
+          # saving state failed. In this case this shard will retry upon
+          # finalization error.
+          # TODO(user): make finalize method idempotent!
+          tstate.output_writer.finalize(ctx, shard_state)
+        shard_state.set_for_success()
+        return self.__return(shard_state, tstate, task_directive)
 
       if is_this_a_retry:
         task_directive = self._attempt_slice_recovery(shard_state, tstate)
@@ -468,23 +502,15 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
       last_slice = self._process_inputs(
           tstate.input_reader, shard_state, tstate, ctx)
 
-      self._maintain_LC(tstate.handler, slice_id, last_slice, False)
-      self._maintain_LC(tstate.input_reader, slice_id, last_slice, False)
-      self._maintain_LC(tstate.output_writer, slice_id, last_slice, False)
+      self._lc_end_slice(tstate, slice_id)
 
       ctx.flush()
 
       if last_slice:
-        # Since there was no exception raised, we can finalize output writer
-        # safely. Otherwise writer might be stuck in some bad state.
-        if (tstate.output_writer and
-            isinstance(tstate.output_writer, output_writers.OutputWriter)):
-          # It's possible that finalization is successful but
-          # saving state failed. In this case this shard will retry upon
-          # finalization error.
-          # TODO(user): make finalize method idempotent!
-          tstate.output_writer.finalize(ctx, shard_state)
-        shard_state.set_for_success()
+        # We're done processing data but we still need to finalize the output
+        # stream. We save this condition in datastore and force a new slice.
+        # That way if finalize fails no input data will be retried.
+        shard_state.set_input_finished()
     # pylint: disable=broad-except
     except Exception, e:
       logging.warning("Shard %s got error.", shard_state.shard_id)
@@ -503,6 +529,7 @@ class MapperWorkerCallbackHandler(base_handler.HugeTaskHandler):
     """Handler should always call this as the last statement."""
     task_directive = self._set_state(shard_state, tstate, task_directive)
     self._save_state_and_schedule_next(shard_state, tstate, task_directive)
+    context.Context._set(None)
 
   def _process_inputs(self,
                       input_reader,
@@ -1109,23 +1136,31 @@ class ControllerCallbackHandler(base_handler.HugeTaskHandler):
     state.active_shards, state.aborted_shards, state.failed_shards = 0, 0, 0
     total_shards = 0
     processed_counts = []
+    processed_status = []
     state.counters_map.clear()
 
     # Tally across shard states once.
     for s in shard_states:
       total_shards += 1
+      status = 'unknown'
       if s.active:
         state.active_shards += 1
-      if s.result_status == model.ShardState.RESULT_ABORTED:
+        status = 'running'
+      if s.result_status == model.ShardState.RESULT_SUCCESS:
+        status = 'success'
+      elif s.result_status == model.ShardState.RESULT_ABORTED:
         state.aborted_shards += 1
+        status = 'aborted'
       elif s.result_status == model.ShardState.RESULT_FAILED:
         state.failed_shards += 1
+        status = 'failed'
 
       # Update stats in mapreduce state by aggregating stats from shard states.
       state.counters_map.add_map(s.counters_map)
       processed_counts.append(s.counters_map.get(context.COUNTER_MAPPER_CALLS))
+      processed_status.append(status)
 
-    state.set_processed_counts(processed_counts)
+    state.set_processed_counts(processed_counts, processed_status)
     state.last_poll_time = datetime.datetime.utcfromtimestamp(self._time())
 
     spec = state.mapreduce_spec
@@ -1423,8 +1458,9 @@ class KickOffJobHandler(base_handler.TaskQueueHandler):
     if serialized_input_readers is None:
       readers = input_reader_class.split_input(split_param)
     else:
-      readers = [input_reader_class.from_json_str(json) for json in
-                 simplejson.loads(serialized_input_readers.payload)]
+      readers = [input_reader_class.from_json_str(_json) for _json in
+                 json.loads(zlib.decompress(
+                 serialized_input_readers.payload))]
 
     if not readers:
       return None, None
@@ -1439,7 +1475,8 @@ class KickOffJobHandler(base_handler.TaskQueueHandler):
       serialized_input_readers = model._HugeTaskPayload(
           key_name=serialized_input_readers_key, parent=state)
       readers_json_str = [i.to_json_str() for i in readers]
-      serialized_input_readers.payload = simplejson.dumps(readers_json_str)
+      serialized_input_readers.payload = zlib.compress(json.dumps(
+                                                       readers_json_str))
     return readers, serialized_input_readers
 
   def _setup_output_writer(self, state):

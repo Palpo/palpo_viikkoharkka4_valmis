@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-#
-# Copyright 2011 Google Inc.
+# Copyright 2011 Google Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +22,6 @@ __all__ = [
     ]
 
 
-from google.appengine.api import files
 from mapreduce import control
 from mapreduce import model
 from mapreduce import parameters
@@ -44,6 +42,7 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
     output_writer_spec: output writer specification as string.
     params: mapper parameters for input reader and output writer as dict.
     shards: number of shards in the job as int.
+    base_path: (optional) the path prefix under which requests to the servlet should go.
 
   Returns:
     default: the list of filenames produced by the mapper if there was any
@@ -69,7 +68,8 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
           input_reader_spec,
           output_writer_spec=None,
           params=None,
-          shards=None):
+          shards=None,
+          base_path=None):
     """Start a mapreduce job.
 
     Args:
@@ -84,7 +84,8 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
     """
     if shards is None:
       shards = parameters.config.SHARD_COUNT
-
+    if base_path is None:
+      base_path = parameters.config.BASE_PATH
     mapreduce_id = control.start_map(
         job_name,
         handler_spec,
@@ -94,13 +95,15 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
             "done_callback": self.get_callback_url(),
             "done_callback_method": "GET",
             "pipeline_id": self.pipeline_id,
+            "base_path": base_path,
         },
         shard_count=shards,
         output_writer_spec=output_writer_spec,
+        queue_name=self.queue_name,
         )
     self.fill(self.outputs.job_id, mapreduce_id)
     self.set_status(console_url="%s/detail?mapreduce_id=%s" % (
-        (parameters.config.BASE_PATH, mapreduce_id)))
+        (base_path, mapreduce_id)))
 
   def try_cancel(self):
     """Always allow mappers to be canceled and retried."""
@@ -108,6 +111,9 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
 
   def callback(self):
     """Callback after this async pipeline finishes."""
+    if self.was_aborted:
+      return
+
     mapreduce_id = self.outputs.job_id.value
     mapreduce_state = model.MapreduceState.get_by_job_id(mapreduce_id)
     if mapreduce_state.result_status != model.MapreduceState.RESULT_SUCCESS:
@@ -125,27 +131,3 @@ class MapperPipeline(pipeline_base._OutputSlotsMixin,
     self.fill(self.outputs.result_status, mapreduce_state.result_status)
     self.fill(self.outputs.counters, mapreduce_state.counters_map.to_dict())
     self.complete(outputs)
-
-
-class _CleanupPipeline(pipeline_base.PipelineBase):
-  """A pipeline to do a cleanup for mapreduce jobs.
-
-  Args:
-    filename_or_list: list of files or file lists to delete.
-  """
-
-  def delete_file_or_list(self, filename_or_list):
-    if isinstance(filename_or_list, list):
-      for filename in filename_or_list:
-        self.delete_file_or_list(filename)
-    else:
-      filename = filename_or_list
-      for _ in range(10):
-        try:
-          files.delete(filename)
-          break
-        except:
-          pass
-
-  def run(self, temp_files):
-    self.delete_file_or_list(temp_files)
